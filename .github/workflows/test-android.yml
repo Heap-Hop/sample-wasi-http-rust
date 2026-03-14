@@ -4,13 +4,30 @@ on:
   workflow_dispatch:
   push:
 
-jobs:
-  repro:
-    runs-on: macos-latest
-    timeout-minutes: 45
+env:
+  WASMTIME_VERSION: 42.0.1
+  ANDROID_API_LEVEL: 34
+  AVD_NAME: android-arm64
 
-    env:
-      WASMTIME_VERSION: 42.0.1
+jobs:
+  manual-repro:
+    name: manual-${{ matrix.id }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: google-apis-kvm
+            target: google_apis
+            emulator_options: -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data -gpu swiftshader
+          - id: google-apis-software
+            target: google_apis
+            emulator_options: -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data -accel off -gpu swiftshader
+          - id: default-software
+            target: default
+            emulator_options: -no-window -no-audio -no-boot-anim -no-snapshot -wipe-data -accel off -gpu swiftshader
 
     steps:
       - name: Checkout
@@ -37,54 +54,77 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Host diagnostics
+        run: |
+          set -euo pipefail
+
+          uname -a
+          uname -m
+          lscpu || true
+          ls -l /dev/kvm || true
+          if [ -e /dev/kvm ]; then
+            sudo chmod 0666 /dev/kvm || true
+          fi
+          adb version
+          sdkmanager --version
+          "$ANDROID_HOME/emulator/emulator" -version
+          "$ANDROID_HOME/emulator/emulator" -accel-check || true
+
       - name: Install Emulator Image
         run: |
-          sdkmanager "system-images;android-34;google_apis;arm64-v8a"
+          sdkmanager "system-images;android-${ANDROID_API_LEVEL};${{ matrix.target }};arm64-v8a"
 
       - name: Create AVD
         run: |
           echo "no" | avdmanager create avd \
-            -n android-arm64 \
-            -k "system-images;android-34;google_apis;arm64-v8a"
+            -n "$AVD_NAME" \
+            -k "system-images;android-${ANDROID_API_LEVEL};${{ matrix.target }};arm64-v8a"
 
       - name: Start Emulator
         run: |
           set -euo pipefail
 
-          $ANDROID_HOME/emulator/emulator \
-            -avd android-arm64 \
-            -no-window \
-            -no-audio \
-            -no-boot-anim \
-            -no-snapshot \
-            -wipe-data \
-            -accel off \
-            -gpu swiftshader_indirect &
+          "$ANDROID_HOME/emulator/emulator" \
+            -avd "$AVD_NAME" \
+            -verbose \
+            -show-kernel \
+            -camera-back none \
+            -camera-front none \
+            -selinux permissive \
+            ${{ matrix.emulator_options }} \
+            > emulator.log 2>&1 &
 
           emulator_pid=$!
+          boot_completed=0
 
-          for _ in $(seq 1 60); do
+          for _ in $(seq 1 120); do
             if ! kill -0 "$emulator_pid" 2>/dev/null; then
               echo "Android emulator exited before boot completed"
-              adb devices
+              tail -n 200 emulator.log || true
+              adb devices || true
               exit 1
             fi
 
             state="$(adb get-state 2>/dev/null || true)"
-            if [ "$state" = "device" ] && adb shell getprop sys.boot_completed | tr -d '\r' | grep -q '^1$'; then
-              adb shell getprop sys.boot_completed | tr -d '\r' | grep '^1$'
-              exit 0
+            boot_prop="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+            if [ "$state" = "device" ] && [ "$boot_prop" = "1" ]; then
+              boot_completed=1
+              break
             fi
 
             sleep 5
           done
 
-          echo "Android emulator did not finish booting in time"
-          adb devices
-          if kill -0 "$emulator_pid" 2>/dev/null; then
-            kill "$emulator_pid"
+          if [ "$boot_completed" -ne 1 ]; then
+            echo "Android emulator did not finish booting in time"
+            tail -n 200 emulator.log || true
+            adb devices || true
+            exit 1
           fi
-          exit 1
+
+          adb devices
+          adb shell getprop ro.product.cpu.abi
+          adb shell getprop sys.boot_completed | tr -d '\r' | grep '^1$'
 
       - name: Push binaries
         run: |
@@ -119,7 +159,7 @@ jobs:
 
           print_logs() {
             echo '===== wasmtime.log ====='
-            adb shell 'cat /data/local/tmp/wasmtime.log' | tr -d '\r'
+            adb shell 'cat /data/local/tmp/wasmtime.log' | tee wasmtime.log | tr -d '\r'
           }
 
           run_case() {
@@ -151,3 +191,165 @@ jobs:
 
           echo 'Wasmtime server stayed alive through all payload sizes.'
           print_logs
+
+      - name: Collect device logs
+        if: always()
+        run: |
+          set +e
+          adb shell 'cat /data/local/tmp/wasmtime.log' > wasmtime.log
+          adb logcat -d > logcat.txt
+          adb shell getprop > device-props.txt
+          adb shell dmesg > device-dmesg.txt
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual-${{ matrix.id }}-logs
+          path: |
+            emulator.log
+            wasmtime.log
+            logcat.txt
+            device-props.txt
+            device-dmesg.txt
+          if-no-files-found: warn
+
+  action-repro:
+    name: action-${{ matrix.id }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: google-apis-kvm
+            target: google_apis
+            disable_linux_hw_accel: 'false'
+          - id: google-apis-software
+            target: google_apis
+            disable_linux_hw_accel: 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Build sample wasm
+        run: |
+          cargo build --release --target wasm32-wasip2
+
+      - name: Download Android Wasmtime
+        run: |
+          curl -L \
+            -o wasmtime-aarch64-android.tar.xz \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-aarch64-android.tar.xz"
+          tar -xf wasmtime-aarch64-android.tar.xz
+          cp "wasmtime-v${WASMTIME_VERSION}-aarch64-android/wasmtime" ./wasmtime
+          chmod +x ./wasmtime
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Host diagnostics
+        run: |
+          set -euo pipefail
+
+          uname -a
+          uname -m
+          lscpu || true
+          ls -l /dev/kvm || true
+          if [ -e /dev/kvm ]; then
+            sudo chmod 0666 /dev/kvm || true
+          fi
+          adb version
+          "$ANDROID_HOME/emulator/emulator" -version || true
+          "$ANDROID_HOME/emulator/emulator" -accel-check || true
+
+      - name: Run Android Emulator Runner
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ env.ANDROID_API_LEVEL }}
+          arch: arm64-v8a
+          target: ${{ matrix.target }}
+          avd-name: ${{ env.AVD_NAME }}-${{ matrix.id }}
+          emulator-boot-timeout: 900
+          disable-linux-hw-accel: ${{ matrix.disable_linux_hw_accel }}
+          emulator-options: -no-window -gpu swiftshader -noaudio -no-boot-anim -no-snapshot -wipe-data
+          script: |
+            set -euo pipefail
+
+            adb devices
+            adb shell getprop ro.product.cpu.abi
+
+            adb push wasmtime /data/local/tmp/
+            adb push target/wasm32-wasip2/release/sample_wasi_http_rust.wasm /data/local/tmp/
+            adb shell chmod +x /data/local/tmp/wasmtime
+
+            adb shell '
+              cd /data/local/tmp && \
+              export HOME=/data/local/tmp && \
+              rm -f wasmtime.log wasmtime.pid && \
+              nohup ./wasmtime serve -Scli -Shttp ./sample_wasi_http_rust.wasm >wasmtime.log 2>&1 </dev/null & \
+              echo $! > wasmtime.pid
+            '
+
+            sleep 5
+            adb shell 'pid=$(cat /data/local/tmp/wasmtime.pid); kill -0 "$pid"'
+            adb forward tcp:8080 tcp:8080
+
+            check_server() {
+              adb shell 'pid=$(cat /data/local/tmp/wasmtime.pid); kill -0 "$pid"' >/dev/null 2>&1
+            }
+
+            print_logs() {
+              echo '===== wasmtime.log ====='
+              adb shell 'cat /data/local/tmp/wasmtime.log' | tee wasmtime.log | tr -d '\r'
+            }
+
+            run_case() {
+              repeat="$1"
+              echo "Triggering /echo with ${repeat} repetitions of 'data'"
+
+              set +e
+              curl --silent --show-error \
+                --data "$(printf 'data%.0s' $(seq 1 "$repeat"))" \
+                http://127.0.0.1:8080/echo \
+                > /dev/null
+              curl_status=$?
+              set -e
+
+              echo "curl exit status: ${curl_status}"
+
+              if ! check_server; then
+                echo "Wasmtime server crashed after repeat=${repeat}"
+                print_logs
+                exit 1
+              fi
+            }
+
+            run_case 1000
+            run_case 2000
+            run_case 3000
+            run_case 4000
+            run_case 5000
+
+            echo 'Wasmtime server stayed alive through all payload sizes.'
+            print_logs
+            adb shell getprop > device-props.txt
+            adb logcat -d > logcat.txt
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: action-${{ matrix.id }}-logs
+          path: |
+            wasmtime.log
+            logcat.txt
+            device-props.txt
+          if-no-files-found: warn
