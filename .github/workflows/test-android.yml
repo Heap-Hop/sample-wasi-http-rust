@@ -49,21 +49,42 @@ jobs:
 
       - name: Start Emulator
         run: |
+          set -euo pipefail
+
           $ANDROID_HOME/emulator/emulator \
             -avd android-arm64 \
             -no-window \
             -no-audio \
             -no-boot-anim \
+            -no-snapshot \
+            -wipe-data \
+            -accel off \
             -gpu swiftshader_indirect &
 
-          adb wait-for-device
+          emulator_pid=$!
+
           for _ in $(seq 1 60); do
-            if adb shell getprop sys.boot_completed | tr -d '\r' | grep -q '^1$'; then
-              break
+            if ! kill -0 "$emulator_pid" 2>/dev/null; then
+              echo "Android emulator exited before boot completed"
+              adb devices
+              exit 1
             fi
+
+            state="$(adb get-state 2>/dev/null || true)"
+            if [ "$state" = "device" ] && adb shell getprop sys.boot_completed | tr -d '\r' | grep -q '^1$'; then
+              adb shell getprop sys.boot_completed | tr -d '\r' | grep '^1$'
+              exit 0
+            fi
+
             sleep 5
           done
-          adb shell getprop sys.boot_completed | tr -d '\r' | grep '^1$'
+
+          echo "Android emulator did not finish booting in time"
+          adb devices
+          if kill -0 "$emulator_pid" 2>/dev/null; then
+            kill "$emulator_pid"
+          fi
+          exit 1
 
       - name: Push binaries
         run: |
