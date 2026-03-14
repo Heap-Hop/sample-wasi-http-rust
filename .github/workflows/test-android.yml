@@ -1,0 +1,132 @@
+name: wasmtime-android-repro
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  repro:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    env:
+      WASMTIME_VERSION: 42.0.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Build sample wasm
+        run: |
+          cargo build --release --target wasm32-wasip2
+
+      - name: Download Android Wasmtime
+        run: |
+          curl -L \
+            -o wasmtime-aarch64-android.tar.xz \
+            "https://github.com/bytecodealliance/wasmtime/releases/download/v${WASMTIME_VERSION}/wasmtime-v${WASMTIME_VERSION}-aarch64-android.tar.xz"
+          tar -xf wasmtime-aarch64-android.tar.xz
+          cp "wasmtime-v${WASMTIME_VERSION}-aarch64-android/wasmtime" ./wasmtime
+          chmod +x ./wasmtime
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Emulator Image
+        run: |
+          sdkmanager "system-images;android-34;google_apis;arm64-v8a"
+
+      - name: Create AVD
+        run: |
+          echo "no" | avdmanager create avd \
+            -n android-arm64 \
+            -k "system-images;android-34;google_apis;arm64-v8a"
+
+      - name: Start Emulator
+        run: |
+          $ANDROID_HOME/emulator/emulator \
+            -avd android-arm64 \
+            -no-window \
+            -no-audio \
+            -no-boot-anim \
+            -gpu swiftshader_indirect &
+
+          adb wait-for-device
+          for _ in $(seq 1 60); do
+            if adb shell getprop sys.boot_completed | tr -d '\r' | grep -q '^1$'; then
+              break
+            fi
+            sleep 5
+          done
+          adb shell getprop sys.boot_completed | tr -d '\r' | grep '^1$'
+
+      - name: Push binaries
+        run: |
+          adb push wasmtime /data/local/tmp/
+          adb push target/wasm32-wasip2/release/sample_wasi_http_rust.wasm /data/local/tmp/
+          adb shell chmod +x /data/local/tmp/wasmtime
+
+      - name: Start Wasmtime server
+        run: |
+          adb shell '
+            cd /data/local/tmp && \
+            export HOME=/data/local/tmp && \
+            rm -f wasmtime.log wasmtime.pid && \
+            nohup ./wasmtime serve -Scli -Shttp ./sample_wasi_http_rust.wasm >wasmtime.log 2>&1 </dev/null & \
+            echo $! > wasmtime.pid
+          '
+
+          sleep 5
+          adb shell 'pid=$(cat /data/local/tmp/wasmtime.pid); kill -0 "$pid"'
+
+      - name: Port forward
+        run: |
+          adb forward tcp:8080 tcp:8080
+
+      - name: Trigger crash via /echo
+        run: |
+          set -euo pipefail
+
+          check_server() {
+            adb shell 'pid=$(cat /data/local/tmp/wasmtime.pid); kill -0 "$pid"' >/dev/null 2>&1
+          }
+
+          print_logs() {
+            echo '===== wasmtime.log ====='
+            adb shell 'cat /data/local/tmp/wasmtime.log' | tr -d '\r'
+          }
+
+          run_case() {
+            repeat="$1"
+            echo "Triggering /echo with ${repeat} repetitions of 'data'"
+
+            set +e
+            curl --silent --show-error \
+              --data "$(printf 'data%.0s' $(seq 1 "$repeat"))" \
+              http://127.0.0.1:8080/echo \
+              > /dev/null
+            curl_status=$?
+            set -e
+
+            echo "curl exit status: ${curl_status}"
+
+            if ! check_server; then
+              echo "Wasmtime server crashed after repeat=${repeat}"
+              print_logs
+              exit 1
+            fi
+          }
+
+          run_case 1000
+          run_case 2000
+          run_case 3000
+          run_case 4000
+          run_case 5000
+
+          echo 'Wasmtime server stayed alive through all payload sizes.'
+          print_logs
